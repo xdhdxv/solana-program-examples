@@ -1,9 +1,10 @@
 use anyhow::Result;
+use borsh::BorshSerialize;
 
 use solana_program_test::*;
 
 use solana_sdk::{
-    address_lookup_table::instruction, pubkey::Pubkey
+    instruction::Instruction, pubkey::Pubkey, signer::Signer, transaction::Transaction
 };
 
 use program::*;
@@ -29,10 +30,39 @@ async fn instruction_flow_test() -> Result<()> {
 
     println!("Testing add movie instruction...");
 
-    let add_movie_review_instruction_data = MovieReviewPayload {
+    let movie_review_payload = MovieReviewPayload {
         title: movie_title,
         rating: movie_rating,
         description: movie_description
     };
 
+    let mut add_movie_instruction_data = vec![0];
+
+    movie_review_payload.serialize(&mut add_movie_instruction_data);
+
+    let add_movie_review_ix = Instruction::new_with_bytes(
+        program_id, 
+        &add_movie_instruction_data, 
+        vec![],
+    );
+
+    let add_movie_review_tx = Transaction::new_signed_with_payer(
+        &[add_movie_review_ix], 
+        Some(&payer.pubkey()), 
+        &[&payer], 
+        recent_blockhash,
+    );
+
+    let add_movie_review_tx_result = banks_client.process_transaction(add_movie_review_tx).await;
+
+    assert!(add_movie_review_tx_result.is_ok());
+
+    Ok(())
+}
+
+#[derive(BorshSerialize)]
+struct MovieReviewPayload {
+    title: String,
+    rating: u8,
+    description: String,
 }
