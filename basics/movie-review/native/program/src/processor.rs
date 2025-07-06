@@ -6,14 +6,13 @@ use solana_program::{
     sysvar::{Sysvar, rent::Rent},
     program::invoke_signed,
     program_pack::IsInitialized,
-    msg,
     borsh1::try_from_slice_unchecked,
 };
 
 use borsh::BorshSerialize;
 
 use crate::instruction::MovieInstruction;
-use crate::state::MovieAccountState;
+use crate::state::{ReviewState, ReviewCommentCounterState, ReviewCommentState};
 use crate::error::ReviewError;
 
 pub fn process_instruction(
@@ -30,6 +29,9 @@ pub fn process_instruction(
         MovieInstruction::UpdateMovieReview { title, rating, description } => {
             process_update_movie_review(program_id, accounts, title, rating, description)
         },
+        MovieInstruction::AddComment { comment } => {
+            process_add_comment(program_id, accounts, comment)
+        }
     }
 }
 
@@ -40,27 +42,23 @@ pub fn process_add_movie_review(
     rating: u8,
     description: String,
 ) -> ProgramResult {
-    msg!("Adding movie review...");
-    msg!("Title: {}", title);
-    msg!("Rating: {}", rating);
-    msg!("Description: {}", description);
-
     let accounts_iter = &mut accounts.iter();
     
     let reviewer = next_account_info(accounts_iter)?;
-    let movie_review_account = next_account_info(accounts_iter)?;
+    let movie_review = next_account_info(accounts_iter)?;
+    let counter = next_account_info(accounts_iter)?;    
     let system_program = next_account_info(accounts_iter)?;
 
     if !reviewer.is_signer {
         return Err(ProgramError::MissingRequiredSignature)
     }
 
-    let (pda, bump_seed) = Pubkey::find_program_address(
+    let (movie_review_pda, movie_review_bump) = Pubkey::find_program_address(
         &[reviewer.key.as_ref(), title.as_bytes().as_ref()], 
         program_id,
     );
 
-    if *movie_review_account.key != pda {
+    if *movie_review.key != movie_review_pda {
         return Err(ProgramError::InvalidSeeds);
     }
 
@@ -68,58 +66,98 @@ pub fn process_add_movie_review(
         return Err(ReviewError::InvalidRating.into());
     }
 
-    let total_len = 1 + 1 + (4 + title.len()) + (4 + description.len());
-    if total_len > 1000 {
+    let total_len = ReviewState::space(&title, &description);
+    if total_len > ReviewState::MAX_SPACE {
         return Err(ReviewError::InvalidDataLength.into());
     }
 
-    let movie_account_space = 1000;
-
     let rent = Rent::get()?;
 
-    let movie_account_rent = rent.minimum_balance(movie_account_space);
+    let movie_account_rent = rent.minimum_balance(ReviewState::MAX_SPACE);
 
     invoke_signed(
         &solana_system_interface::instruction::create_account(
             reviewer.key, 
-            movie_review_account.key, 
+            movie_review.key, 
             movie_account_rent, 
-            movie_account_space as u64, 
+            ReviewState::MAX_SPACE as u64, 
             program_id,
         ), 
         &[
             reviewer.clone(), 
-            movie_review_account.clone(), 
+            movie_review.clone(), 
             system_program.clone(),
         ], 
         &[
             &[
                 reviewer.key.as_ref(), 
                 title.as_bytes().as_ref(),
-                &[bump_seed],
+                &[movie_review_bump],
             ],
         ]
     )?;
 
-    msg!("Movie Review Account created: {}", movie_review_account.key);
 
-    msg!("Unpacking movie review account");
     let mut movie_review_account_data = 
-        try_from_slice_unchecked::<MovieAccountState>(&movie_review_account.data.borrow())?;   
-    msg!("Borrowed account data");
+        try_from_slice_unchecked::<ReviewState>(&movie_review.data.borrow())?;   
 
     if movie_review_account_data.is_initialized() {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
+    movie_review_account_data.discriminator = ReviewState::DISCRIMINATOR.to_string();
+    movie_review_account_data.reviewer = *reviewer.key;
     movie_review_account_data.title = title;
     movie_review_account_data.rating = rating;
     movie_review_account_data.description = description;
     movie_review_account_data.is_initialized = true;
 
-    msg!("Serializing account");
-    movie_review_account_data.serialize(&mut &mut movie_review_account.data.borrow_mut()[..])?;
-    msg!("Movie review account serialized");
+    movie_review_account_data.serialize(&mut &mut movie_review.data.borrow_mut()[..])?;
+
+    let counter_rent = rent.minimum_balance(ReviewCommentCounterState::SPACE);
+
+    let (counter_pda, counter_bump) = Pubkey::find_program_address(
+        &[movie_review.key.as_ref(), b"counter"], 
+        program_id,
+    );
+
+    if *counter.key != counter_pda {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    invoke_signed(
+        &solana_system_interface::instruction::create_account(
+            reviewer.key, 
+            counter.key, 
+            counter_rent, 
+            ReviewCommentCounterState::SPACE as u64, 
+            program_id,
+        ), 
+        &[
+            reviewer.clone(), 
+            counter.clone(), 
+            system_program.clone(),
+        ], 
+        &[
+            &[
+                movie_review.key.as_ref(), b"counter", &[counter_bump],
+            ]
+        ],
+    )?;
+
+
+    let mut counter_data =
+        try_from_slice_unchecked::<ReviewCommentCounterState>(&counter.data.borrow())?;
+
+    if counter_data.is_initialized() {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    counter_data.discriminator = ReviewCommentCounterState::DISCRIMINATOR.to_string();
+    counter_data.counter = 0;
+    counter_data.is_initialized = true;
+
+    counter_data.serialize(&mut &mut counter.data.borrow_mut()[..])?;
 
     Ok(())
 }
@@ -153,10 +191,8 @@ pub fn process_update_movie_review(
         return Err(ProgramError::InvalidSeeds);
     }
 
-    msg!("Unpacking state account");
     let mut movie_review_account_data = 
-        try_from_slice_unchecked::<MovieAccountState>(&movie_review_account.data.borrow())?;
-    msg!("Borrowed account data");
+        try_from_slice_unchecked::<ReviewState>(&movie_review_account.data.borrow())?;
 
     if !movie_review_account_data.is_initialized() {
         return Err(ProgramError::UninitializedAccount);
@@ -166,8 +202,8 @@ pub fn process_update_movie_review(
         return Err(ReviewError::InvalidRating.into());
     }
 
-    let total_len = 1 + 1 + (4 + title.len()) + (4 + description.len());
-    if total_len > 1000 {
+    let total_len = ReviewState::space(&title, &description);
+    if total_len > ReviewState::MAX_SPACE {
         return Err(ReviewError::InvalidDataLength.into());
     }
 
@@ -175,6 +211,85 @@ pub fn process_update_movie_review(
     movie_review_account_data.description = description;
 
     movie_review_account_data.serialize(&mut &mut movie_review_account.data.borrow_mut()[..])?;
+
+    Ok(())
+}
+
+pub fn process_add_comment(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    comment: String,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    let commenter = next_account_info(accounts_iter)?;
+    let movie_review = next_account_info(accounts_iter)?;
+    let counter = next_account_info(accounts_iter)?;
+    let comment_account = next_account_info(accounts_iter)?;
+    let system_program = next_account_info(accounts_iter)?;
+
+    let mut counter_data = 
+        try_from_slice_unchecked::<ReviewCommentCounterState>(&counter.data.borrow())?;
+
+    let comment_account_space = ReviewCommentState::space(&comment);
+
+    let rent = Rent::get()?;
+    let comment_account_rent = rent.minimum_balance(comment_account_space);
+
+    let (comment_pda, comment_pda_bump) = Pubkey::find_program_address(
+        &[
+            movie_review.key.as_ref(),
+            counter_data.counter.to_be_bytes().as_ref(),
+        ], 
+        program_id,
+    );
+
+    if *comment_account.key != comment_pda {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    invoke_signed(
+        &solana_system_interface::instruction::create_account(
+            commenter.key, 
+            comment_account.key, 
+            comment_account_rent, 
+            comment_account_space as u64, 
+            program_id,
+        ), 
+        &[
+            commenter.clone(),
+            comment_account.clone(),
+            system_program.clone(),
+        ], 
+        &[
+            &[
+                movie_review.key.as_ref(),
+                counter_data.counter.to_be_bytes().as_ref(),
+                &[comment_pda_bump],
+            ]
+        ],
+    )?;
+
+    let mut comment_account_data =
+        try_from_slice_unchecked::<ReviewCommentState>(&comment_account.data.borrow())?;
+
+    if comment_account_data.is_initialized() {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    comment_account_data.discriminator = ReviewCommentState::DISCRIMINATOR.to_string();
+    comment_account_data.review = *movie_review.key;
+    comment_account_data.commenter = *commenter.key;
+    comment_account_data.comment = comment;
+    comment_account_data.count = counter_data.counter;
+    comment_account_data.is_initialized = true;
+
+    comment_account_data.serialize(&mut &mut comment_account.data.borrow_mut()[..])?;
+
+    counter_data.counter = 
+        counter_data.counter.checked_add(1).ok_or(ProgramError::ArithmeticOverflow)?;
+        
+    counter_data.serialize(&mut &mut counter.data.borrow_mut()[..])?;
 
     Ok(())
 }
