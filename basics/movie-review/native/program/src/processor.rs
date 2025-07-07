@@ -7,7 +7,16 @@ use solana_program::{
     program::invoke_signed,
     program_pack::IsInitialized,
     borsh1::try_from_slice_unchecked,
+    native_token::LAMPORTS_PER_SOL,
+    program_pack::Pack,
 };
+use solana_system_interface::instruction::create_account;
+use spl_token::{
+    id as token_program_id, 
+    instruction::{initialize_mint2, mint_to},
+    state::Mint,
+};
+use spl_associated_token_account::get_associated_token_address;
 
 use borsh::BorshSerialize;
 
@@ -31,6 +40,9 @@ pub fn process_instruction(
         },
         MovieInstruction::AddComment { comment } => {
             process_add_comment(program_id, accounts, comment)
+        },
+        MovieInstruction::InitializeMint => {
+            initialize_token_mint(program_id, accounts)
         }
     }
 }
@@ -46,8 +58,12 @@ pub fn process_add_movie_review(
     
     let reviewer = next_account_info(accounts_iter)?;
     let movie_review = next_account_info(accounts_iter)?;
-    let counter = next_account_info(accounts_iter)?;    
+    let counter = next_account_info(accounts_iter)?;
+    let token_mint = next_account_info(accounts_iter)?;
+    let mint_auth = next_account_info(accounts_iter)?;
+    let user_ata = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
+    let token_program = next_account_info(accounts_iter)?;
 
     if !reviewer.is_signer {
         return Err(ProgramError::MissingRequiredSignature)
@@ -159,6 +175,42 @@ pub fn process_add_movie_review(
 
     counter_data.serialize(&mut &mut counter.data.borrow_mut()[..])?;
 
+    let (mint_pda, _mint_bump) = 
+        Pubkey::find_program_address(&[b"token_mint"], program_id);
+    let (mint_auth_pda, mint_auth_bump) =
+        Pubkey::find_program_address(&[b"mint_auth"], program_id);
+
+    if *token_mint.key != mint_pda {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *mint_auth.key != mint_auth_pda {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *user_ata.key != get_associated_token_address(reviewer.key, token_mint.key) {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *token_program.key != token_program_id() {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    invoke_signed(
+        &mint_to(
+            token_program.key, 
+            token_mint.key, 
+            user_ata.key, 
+            mint_auth.key, 
+            &[], 
+            10 * LAMPORTS_PER_SOL,
+        )?, 
+        &[token_mint.clone(), user_ata.clone(), mint_auth.clone()], 
+        &[
+            &[b"mint_auth", &[mint_auth_bump]]
+        ],
+    )?;
+
     Ok(())
 }
 
@@ -226,7 +278,11 @@ pub fn process_add_comment(
     let movie_review = next_account_info(accounts_iter)?;
     let counter = next_account_info(accounts_iter)?;
     let comment_account = next_account_info(accounts_iter)?;
+    let token_mint = next_account_info(accounts_iter)?;
+    let mint_auth = next_account_info(accounts_iter)?;
+    let user_ata = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
+    let token_program = next_account_info(accounts_iter)?;
 
     let mut counter_data = 
         try_from_slice_unchecked::<ReviewCommentCounterState>(&counter.data.borrow())?;
@@ -290,6 +346,106 @@ pub fn process_add_comment(
         counter_data.counter.checked_add(1).ok_or(ProgramError::ArithmeticOverflow)?;
         
     counter_data.serialize(&mut &mut counter.data.borrow_mut()[..])?;
+
+    let (mint_pda, _mint_bump) =
+        Pubkey::find_program_address(&[b"token_mint"], program_id);
+    let (mint_auth_pda, mint_auth_bump) =
+        Pubkey::find_program_address(&[b"mint_auth"], program_id);
+
+    if *token_mint.key != mint_pda {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *mint_auth.key != mint_auth_pda {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+    
+    if *user_ata.key != get_associated_token_address(commenter.key, token_mint.key) {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *token_program.key != token_program_id() {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    invoke_signed(
+        &mint_to(
+            token_program.key, 
+            token_mint.key, 
+            user_ata.key, 
+            mint_auth.key, 
+            &[], 
+            5 * LAMPORTS_PER_SOL
+        )?, 
+        &[mint_auth.clone(), user_ata.clone(), token_mint.clone()], 
+        &[
+            &[b"mint_auth", &[mint_auth_bump]],
+        ],
+    )?;
+
+    Ok(())
+}
+
+pub fn initialize_token_mint(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    let initializer = next_account_info(accounts_iter)?;
+    let token_mint = next_account_info(accounts_iter)?;
+    let mint_auth = next_account_info(accounts_iter)?;
+    let system_program =next_account_info(accounts_iter)?;
+    let token_program = next_account_info(accounts_iter)?;
+
+    let (mint_pda, mint_bump) = 
+        Pubkey::find_program_address(&[b"token_mint"], program_id);
+    let (mint_auth_pda, _mint_auth_bump) = 
+        Pubkey::find_program_address(&[b"mint_auth"], program_id);
+
+    if *token_mint.key != mint_pda {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *mint_auth.key != mint_auth_pda {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+    
+    if *token_program.key != token_program_id() {
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    let rent = Rent::get()?;
+
+    let mint_rent = rent.minimum_balance(Mint::LEN);
+
+    invoke_signed(
+        &create_account(
+            initializer.key, 
+            token_mint.key, 
+            mint_rent, 
+            Mint::LEN as u64, 
+            token_program.key,
+        ), 
+        &[initializer.clone(), token_mint.clone(), system_program.clone()], 
+        &[
+            &[b"token_mint", &[mint_bump]],
+        ],
+    )?;
+
+    invoke_signed(
+        &initialize_mint2(
+            token_program.key, 
+            token_mint.key, 
+            mint_auth.key, 
+            None, 
+            9,
+        )?, 
+        &[token_mint.clone(), mint_auth.clone()], 
+        &[
+            &[b"token_mint", &[mint_bump]]
+        ],
+    )?;
 
     Ok(())
 }

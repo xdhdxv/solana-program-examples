@@ -15,7 +15,8 @@ pub enum MovieInstruction {
     },
     AddComment {
         comment: String,
-    }
+    },
+    InitializeMint,
 }
 
 impl MovieInstruction {
@@ -52,7 +53,10 @@ impl MovieInstruction {
                     Self::AddComment { 
                         comment: payload.comment 
                     }
-                }
+                },
+                3 => {
+                    Self::InitializeMint
+                },
                 _ => return Err(ProgramError::InvalidInstructionData)
             }
         )

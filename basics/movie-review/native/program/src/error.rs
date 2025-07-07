@@ -5,14 +5,14 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum ReviewError {
     // Error 0
-    #[error("PDA derived does not equal PDA passed in")]
-    InvalidPDA,
-    // Error 1
     #[error("Input data exceeds max length")]
     InvalidDataLength,
-    // Error 2
+    // Error 1
     #[error("Rating less than 1 or greater than 5")]
     InvalidRating,
+    // Error 2
+    #[error("Accounts do not match")]
+    IncorrectAccountError
 }
 
 impl From<ReviewError> for ProgramError {

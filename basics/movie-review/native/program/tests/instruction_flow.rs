@@ -4,17 +4,81 @@ use borsh::BorshSerialize;
 use solana_program_test::*;
 
 use solana_sdk::{
-    pubkey::Pubkey, 
-    signature::{Signer, Keypair}, 
-    instruction::{Instruction, AccountMeta},
-    transaction::Transaction,
-    borsh1::try_from_slice_unchecked,
+    borsh1::try_from_slice_unchecked, instruction::{AccountMeta, Instruction}, program_pack::Pack, pubkey::Pubkey, signature::{Keypair, Signer}, transaction::Transaction,
+    native_token::LAMPORTS_PER_SOL,
 };
-
 use solana_system_interface::program::id as system_program_id;
+use spl_token::id as token_program_id; 
 
 use program::processor::process_instruction;
 use program::state::{ReviewState, ReviewCommentCounterState, ReviewCommentState};
+
+#[tokio::test]
+async fn initialize_token_mint_ix_test() -> Result<()> {
+    let program_id = Pubkey::new_unique();
+
+    let (banks_client, payer, recent_blockhash) = ProgramTest::new(
+        "program", 
+        program_id, 
+        processor!(process_instruction),
+    ).start().await;
+
+    let (token_mint, _token_mint_bump) =
+        Pubkey::find_program_address(&[b"token_mint"], &program_id);
+    let (mint_auth, _mint_auth_bump) =
+        Pubkey::find_program_address(&[b"mint_auth"], &program_id);
+
+    let initialize_token_mint_ix_data = vec![3];
+
+    let initialize_token_mint_ix = Instruction::new_with_bytes(
+        program_id, 
+        &initialize_token_mint_ix_data, 
+        vec![
+            AccountMeta::new(
+                payer.pubkey(), 
+                true,
+            ),
+            AccountMeta::new(
+                token_mint, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                mint_auth, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                system_program_id(), 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
+                false,
+            ),
+        ],
+    );
+
+    let initialize_token_mint_tx = Transaction::new_signed_with_payer(
+        &[initialize_token_mint_ix], 
+        Some(&payer.pubkey()), 
+        &[&payer], 
+        recent_blockhash,
+    );
+
+    let initialize_token_mint_tx_result =
+        banks_client.process_transaction(initialize_token_mint_tx).await;
+
+    assert!(initialize_token_mint_tx_result.is_ok());
+
+    let mint_account = 
+        banks_client.get_account(token_mint).await?.unwrap();
+
+    let mint_account = 
+        spl_token::state::Mint::unpack(&mint_account.data);
+
+    assert!(mint_account.is_ok());
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn add_movie_review_ix_test() -> Result<()> {
@@ -39,11 +103,55 @@ async fn add_movie_review_ix_test() -> Result<()> {
         &[payer.pubkey().as_ref(), movie_title.as_bytes().as_ref()], 
         &program_id,
     );
-
     let (comment_counter, _bump) = Pubkey::find_program_address(
         &[movie_review_account.as_ref(), "counter".as_ref()], 
         &program_id,
     );
+    let (token_mint, _token_mint_bump) =
+        Pubkey::find_program_address(&[b"token_mint"], &program_id);
+    let (mint_auth, _mint_auth_bump) =
+        Pubkey::find_program_address(&[b"mint_auth"], &program_id);
+    let user_ata = spl_associated_token_account::get_associated_token_address(
+        &payer.pubkey(), 
+        &token_mint,
+    );
+
+    let initialize_token_mint_ix_data = vec![3];
+
+    let initialize_token_mint_ix = Instruction::new_with_bytes(
+        program_id, 
+        &initialize_token_mint_ix_data, 
+        vec![
+            AccountMeta::new(
+                payer.pubkey(), 
+                true,
+            ),
+            AccountMeta::new(
+                token_mint, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                mint_auth, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                system_program_id(), 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
+                false,
+            ),
+        ],
+    );
+
+    let create_user_ata_ix = 
+        spl_associated_token_account::instruction::create_associated_token_account(
+            &payer.pubkey(), 
+            &payer.pubkey(), 
+            &token_mint, 
+            &token_program_id(),
+        );
 
     let movie_review_payload = MovieReviewPayload {
         title: movie_title.clone(),
@@ -71,15 +179,31 @@ async fn add_movie_review_ix_test() -> Result<()> {
                 comment_counter,
                 false,
             ),
+            AccountMeta::new(
+                token_mint,
+                false
+            ),
+            AccountMeta::new_readonly(
+                mint_auth,
+                false
+            ),
+            AccountMeta::new(
+                user_ata,
+                false,
+            ),
             AccountMeta::new_readonly(
                 system_program_id(), 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
                 false,
             ),
         ],
     );
 
     let add_movie_review_tx = Transaction::new_signed_with_payer(
-        &[add_movie_review_ix], 
+        &[initialize_token_mint_ix, create_user_ata_ix, add_movie_review_ix], 
         Some(&payer.pubkey()), 
         &[&payer], 
         recent_blockhash,
@@ -116,6 +240,13 @@ async fn add_movie_review_ix_test() -> Result<()> {
     assert_eq!(comment_counter_state.is_initialized, true);
     assert_eq!(comment_counter_state.counter, 0);
 
+    let ata = 
+        banks_client.get_account(user_ata).await?.unwrap();
+    let ata =  
+        spl_token::state::Account::unpack(&ata.data)?;
+
+    assert_eq!(ata.amount, 10 * LAMPORTS_PER_SOL);
+
     Ok(())
 }
 
@@ -144,13 +275,56 @@ async fn add_movie_review_ix_with_invalid_movie_review_account_test() -> Result<
         &[another_reviewer.pubkey().as_ref(), movie_title.as_bytes().as_ref()], 
         &program_id,
     );
-
     let (comment_counter, _bump) = Pubkey::find_program_address(
         &[movie_review_account.as_ref(), "counter".as_ref()], 
         &program_id,
     );
+    let (token_mint, _token_mint_bump) =
+        Pubkey::find_program_address(&[b"token_mint"], &program_id);
+    let (mint_auth, _mint_auth_bump) =
+        Pubkey::find_program_address(&[b"mint_auth"], &program_id);
+    let user_ata = spl_associated_token_account::get_associated_token_address(
+        &payer.pubkey(), 
+        &token_mint,
+    );
 
-    println!("Testing add movie instruction...");
+    let initialize_token_mint_ix_data = vec![3];
+
+    let initialize_token_mint_ix = Instruction::new_with_bytes(
+        program_id, 
+        &initialize_token_mint_ix_data, 
+        vec![
+            AccountMeta::new(
+                payer.pubkey(), 
+                true,
+            ),
+            AccountMeta::new(
+                token_mint, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                mint_auth, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                system_program_id(), 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
+                false,
+            ),
+        ],
+    );
+
+    let create_user_ata_ix = 
+        spl_associated_token_account::instruction::create_associated_token_account(
+            &payer.pubkey(), 
+            &payer.pubkey(), 
+            &token_mint, 
+            &token_program_id(),
+        );
+
 
     let movie_review_payload = MovieReviewPayload {
         title: movie_title.clone(),
@@ -162,7 +336,7 @@ async fn add_movie_review_ix_with_invalid_movie_review_account_test() -> Result<
 
     movie_review_payload.serialize(&mut add_movie_instruction_data)?;
 
-    let add_movie_review_ix = Instruction::new_with_bytes(
+   let add_movie_review_ix = Instruction::new_with_bytes(
         program_id, 
         &add_movie_instruction_data, 
         vec![
@@ -178,15 +352,31 @@ async fn add_movie_review_ix_with_invalid_movie_review_account_test() -> Result<
                 comment_counter,
                 false,
             ),
+            AccountMeta::new(
+                token_mint,
+                false
+            ),
+            AccountMeta::new_readonly(
+                mint_auth,
+                false
+            ),
+            AccountMeta::new(
+                user_ata,
+                false,
+            ),
             AccountMeta::new_readonly(
                 system_program_id(), 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
                 false,
             ),
         ],
     );
 
     let add_movie_review_tx = Transaction::new_signed_with_payer(
-        &[add_movie_review_ix], 
+        &[initialize_token_mint_ix, create_user_ata_ix, add_movie_review_ix], 
         Some(&payer.pubkey()), 
         &[&payer], 
         recent_blockhash,
@@ -228,6 +418,52 @@ async fn update_movie_review_ix_test() -> Result<()> {
         &program_id,
     );
 
+    let (token_mint, _token_mint_bump) =
+        Pubkey::find_program_address(&[b"token_mint"], &program_id);
+    let (mint_auth, _mint_auth_bump) =
+        Pubkey::find_program_address(&[b"mint_auth"], &program_id);
+    let user_ata = spl_associated_token_account::get_associated_token_address(
+        &payer.pubkey(), 
+        &token_mint,
+    );
+
+    let initialize_token_mint_ix_data = vec![3];
+
+    let initialize_token_mint_ix = Instruction::new_with_bytes(
+        program_id, 
+        &initialize_token_mint_ix_data, 
+        vec![
+            AccountMeta::new(
+                payer.pubkey(), 
+                true,
+            ),
+            AccountMeta::new(
+                token_mint, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                mint_auth, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                system_program_id(), 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
+                false,
+            ),
+        ],
+    );
+
+    let create_user_ata_ix = 
+        spl_associated_token_account::instruction::create_associated_token_account(
+            &payer.pubkey(), 
+            &payer.pubkey(), 
+            &token_mint, 
+            &token_program_id(),
+        );
+
     let movie_review_payload = MovieReviewPayload {
         title: movie_title.clone(),
         rating: movie_rating,
@@ -237,7 +473,7 @@ async fn update_movie_review_ix_test() -> Result<()> {
     let mut add_movie_instruction_data = vec![0];
 
     movie_review_payload.serialize(&mut add_movie_instruction_data)?;
-
+    
     let add_movie_review_ix = Instruction::new_with_bytes(
         program_id, 
         &add_movie_instruction_data, 
@@ -254,15 +490,31 @@ async fn update_movie_review_ix_test() -> Result<()> {
                 comment_counter,
                 false,
             ),
+            AccountMeta::new(
+                token_mint,
+                false
+            ),
+            AccountMeta::new_readonly(
+                mint_auth,
+                false
+            ),
+            AccountMeta::new(
+                user_ata,
+                false,
+            ),
             AccountMeta::new_readonly(
                 system_program_id(), 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
                 false,
             ),
         ],
     );
 
     let add_movie_review_tx = Transaction::new_signed_with_payer(
-        &[add_movie_review_ix], 
+        &[initialize_token_mint_ix, create_user_ata_ix, add_movie_review_ix], 
         Some(&payer.pubkey()), 
         &[&payer], 
         recent_blockhash,
@@ -360,6 +612,51 @@ async fn add_comment_ix_test() -> Result<()> {
         &[movie_review_account.as_ref(), "counter".as_ref()], 
         &program_id,
     );
+    let (token_mint, _token_mint_bump) =
+        Pubkey::find_program_address(&[b"token_mint"], &program_id);
+    let (mint_auth, _mint_auth_bump) =
+        Pubkey::find_program_address(&[b"mint_auth"], &program_id);
+    let user_ata = spl_associated_token_account::get_associated_token_address(
+        &payer.pubkey(), 
+        &token_mint,
+    );
+
+    let initialize_token_mint_ix_data = vec![3];
+
+    let initialize_token_mint_ix = Instruction::new_with_bytes(
+        program_id, 
+        &initialize_token_mint_ix_data, 
+        vec![
+            AccountMeta::new(
+                payer.pubkey(), 
+                true,
+            ),
+            AccountMeta::new(
+                token_mint, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                mint_auth, 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                system_program_id(), 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
+                false,
+            ),
+        ],
+    );
+
+    let create_user_ata_ix = 
+        spl_associated_token_account::instruction::create_associated_token_account(
+            &payer.pubkey(), 
+            &payer.pubkey(), 
+            &token_mint, 
+            &token_program_id(),
+        );
 
     let movie_review_payload = MovieReviewPayload {
         title: movie_title.clone(),
@@ -387,15 +684,31 @@ async fn add_comment_ix_test() -> Result<()> {
                 comment_counter,
                 false,
             ),
+            AccountMeta::new(
+                token_mint,
+                false
+            ),
+            AccountMeta::new_readonly(
+                mint_auth,
+                false
+            ),
+            AccountMeta::new(
+                user_ata,
+                false,
+            ),
             AccountMeta::new_readonly(
                 system_program_id(), 
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
                 false,
             ),
         ],
     );
 
     let add_movie_review_tx = Transaction::new_signed_with_payer(
-        &[add_movie_review_ix], 
+        &[initialize_token_mint_ix, create_user_ata_ix, add_movie_review_ix], 
         Some(&payer.pubkey()), 
         &[&payer], 
         recent_blockhash,
@@ -445,8 +758,24 @@ async fn add_comment_ix_test() -> Result<()> {
                 comment_account_pda, 
                 false,
             ),
+            AccountMeta::new(
+                token_mint,
+                false,
+            ),
+            AccountMeta::new_readonly(
+                mint_auth,
+                false,
+            ),
+            AccountMeta::new(
+                user_ata,
+                false
+            ),
             AccountMeta::new_readonly(
                 solana_system_interface::program::id(),
+                false,
+            ),
+            AccountMeta::new_readonly(
+                token_program_id(), 
                 false,
             ),
         ],
@@ -483,6 +812,14 @@ async fn add_comment_ix_test() -> Result<()> {
         try_from_slice_unchecked::<ReviewCommentCounterState>(&comment_counter_state.data)?;
 
     assert_eq!(comment_counter_state.counter, 1);
+
+    
+    let ata = 
+        banks_client.get_account(user_ata).await?.unwrap();
+    let ata =  
+        spl_token::state::Account::unpack(&ata.data)?;
+
+    assert_eq!(ata.amount, 15 * LAMPORTS_PER_SOL);
 
     Ok(())
 }
